@@ -1,0 +1,22 @@
+# Binaries
+/ditto
+/bin/
+
+# Cache & runtime
+.ditto/
+ditto-cache.db
+ditto-cache.db-*
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test
+coverage.out
+coverage.html
