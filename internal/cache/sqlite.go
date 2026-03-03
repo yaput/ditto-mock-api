@@ -117,9 +117,16 @@ func (s *SQLiteStore) Delete(key string) error {
 	return err
 }
 
-// Purge removes all cached responses for a dependency. Returns rows deleted.
+// Purge removes cached responses. If dependency is empty, all entries are removed.
+// Otherwise only entries for the given dependency are removed. Returns rows deleted.
 func (s *SQLiteStore) Purge(dependency string) (int64, error) {
-	res, err := s.db.Exec(`DELETE FROM cached_responses WHERE dependency = ?`, dependency)
+	var res sql.Result
+	var err error
+	if dependency == "" {
+		res, err = s.db.Exec(`DELETE FROM cached_responses`)
+	} else {
+		res, err = s.db.Exec(`DELETE FROM cached_responses WHERE dependency = ?`, dependency)
+	}
 	if err != nil {
 		return 0, err
 	}
