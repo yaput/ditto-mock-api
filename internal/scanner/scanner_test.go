@@ -204,7 +204,96 @@ func SetupRoutes(r chi.Router) {
 		}
 	}
 }
+func TestExtractFromDir_Routes_Stdlib122(t *testing.T) {
+	dir := t.TempDir()
+	writeGoFile(t, dir, "routes.go", `package api
 
+import "net/http"
+
+func SetupRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /health", HealthCheck)
+	mux.HandleFunc("POST /messages/{user_id}/{channel_id}", SendMessage)
+	mux.HandleFunc("GET /conversation/{user_id}/{channel_id}", GetConversation)
+	mux.HandleFunc("/legacy", LegacyHandler)
+}
+`)
+
+	_, routes, _, err := ExtractFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(routes) != 4 {
+		t.Fatalf("expected 4 routes, got %d", len(routes))
+	}
+
+	expected := []struct {
+		method  string
+		path    string
+		handler string
+	}{
+		{"GET", "/health", "HealthCheck"},
+		{"POST", "/messages/{user_id}/{channel_id}", "SendMessage"},
+		{"GET", "/conversation/{user_id}/{channel_id}", "GetConversation"},
+		{"ANY", "/legacy", "LegacyHandler"},
+	}
+
+	for i, e := range expected {
+		if routes[i].Method != e.method {
+			t.Errorf("route %d: expected method %s, got %s", i, e.method, routes[i].Method)
+		}
+		if routes[i].Path != e.path {
+			t.Errorf("route %d: expected path %s, got %s", i, e.path, routes[i].Path)
+		}
+		if routes[i].Handler != e.handler {
+			t.Errorf("route %d: expected handler %s, got %s", i, e.handler, routes[i].Handler)
+		}
+	}
+}
+
+func TestExtractFromDir_HandlerBodyAnalysis(t *testing.T) {
+	dir := t.TempDir()
+	writeGoFile(t, dir, "handler.go", `package api
+
+import (
+	"encoding/json"
+	"net/http"
+)
+
+type CreateRequest struct {
+	Name string
+}
+
+type CreateResponse struct {
+	ID string
+}
+
+func CreateHandler(w http.ResponseWriter, r *http.Request) {
+	var req CreateRequest
+	json.NewDecoder(r.Body).Decode(&req)
+	resp := CreateResponse{ID: "123"}
+	w.WriteHeader(201)
+	json.NewEncoder(w).Encode(resp)
+}
+`)
+
+	_, _, handlers, err := ExtractFromDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(handlers) != 1 {
+		t.Fatalf("expected 1 handler, got %d", len(handlers))
+	}
+	h := handlers[0]
+	if h.Decodes != "CreateRequest" {
+		t.Errorf("expected decodes CreateRequest, got %s", h.Decodes)
+	}
+	if h.Encodes != "CreateResponse" {
+		t.Errorf("expected encodes CreateResponse, got %s", h.Encodes)
+	}
+	if len(h.StatusCodes) != 1 || h.StatusCodes[0] != 201 {
+		t.Errorf("expected status codes [201], got %v", h.StatusCodes)
+	}
+}
 func TestExtractFromDir_Handlers(t *testing.T) {
 	dir := t.TempDir()
 	writeGoFile(t, dir, "handler.go", `package api
@@ -532,6 +621,10 @@ func TestCleanJSONResponse(t *testing.T) {
 		{"markdown plain block", "```\n[{\"a\":1}]\n```", `[{"a":1}]`},
 		{"with whitespace", "  \n[{\"a\":1}]\n  ", `[{"a":1}]`},
 		{"markdown with text before", "Here is the result:\n```json\n[{\"a\":1}]\n```", `[{"a":1}]`},
+		{"trailing comma object", `{"a":1,}`, `{"a":1}`},
+		{"trailing comma array", `[1,2,3,]`, `[1,2,3]`},
+		{"trailing comma nested", `{"items":[{"a":1,},]}`, `{"items":[{"a":1}]}`},
+		{"trailing comma with whitespace", "{\"a\":1 , \n}", `{"a":1 }`},
 	}
 
 	for _, tc := range tests {
@@ -549,6 +642,17 @@ func TestParseEndpointsResponse(t *testing.T) {
 	eps, err := parseEndpointsResponse(raw)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(eps) != 1 {
+		t.Fatalf("expected 1, got %d", len(eps))
+	}
+}
+
+func TestParseEndpointsResponse_TrailingComma(t *testing.T) {
+	raw := `[{"method":"GET","path":"/items","description":"List","request_body":null,"response_body":null,"status_code":200,}]`
+	eps, err := parseEndpointsResponse(raw)
+	if err != nil {
+		t.Fatalf("trailing comma should be tolerated, got: %v", err)
 	}
 	if len(eps) != 1 {
 		t.Fatalf("expected 1, got %d", len(eps))
@@ -768,6 +872,44 @@ func TestTypeToString(t *testing.T) {
 			got := typeToString(tc.expr)
 			if got != tc.want {
 				t.Errorf("got %s, want %s", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseStdlibPattern(t *testing.T) {
+	tests := []struct {
+		pattern    string
+		wantMethod string
+		wantPath   string
+		wantOk     bool
+	}{
+		{"GET /health", "GET", "/health", true},
+		{"POST /messages/{user_id}", "POST", "/messages/{user_id}", true},
+		{"PUT /users/{id}", "PUT", "/users/{id}", true},
+		{"DELETE /items/{id}", "DELETE", "/items/{id}", true},
+		{"PATCH /update", "PATCH", "/update", true},
+		{"/legacy", "", "", false},                           // no method prefix
+		{"GET", "", "", false},                               // no path
+		{"INVALID /foo", "", "", false},                      // invalid method
+		{"get /lowercase", "GET", "/lowercase", true},        // normalized to uppercase
+		{"", "", "", false},                                  // empty
+		{"GET  /double-space", "GET", "/double-space", true}, // SplitN tolerates extra space
+	}
+	for _, tc := range tests {
+		t.Run(tc.pattern, func(t *testing.T) {
+			method, path, ok := parseStdlibPattern(tc.pattern)
+			if ok != tc.wantOk {
+				t.Fatalf("ok = %v, want %v", ok, tc.wantOk)
+			}
+			if !tc.wantOk {
+				return
+			}
+			if method != tc.wantMethod {
+				t.Errorf("method = %s, want %s", method, tc.wantMethod)
+			}
+			if path != tc.wantPath {
+				t.Errorf("path = %s, want %s", path, tc.wantPath)
 			}
 		})
 	}

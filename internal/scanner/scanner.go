@@ -71,12 +71,12 @@ func (s *Scanner) ScanDependency(dep config.DependencyConfig) (*models.Dependenc
 	var allHandlers []models.ExtractedHandler
 
 	for _, dir := range dirs {
-		scanDir := filepath.Join(absRepo, dir)
-		s.logger.Debug("scanning directory", "path", scanDir)
+		scanPath := filepath.Join(absRepo, dir)
+		s.logger.Debug("scanning path", "path", scanPath)
 
-		structs, routes, handlers, scanErr := ExtractFromDir(scanDir)
+		structs, routes, handlers, scanErr := ExtractFromDir(scanPath)
 		if scanErr != nil {
-			s.logger.Warn("error scanning directory", "path", scanDir, "error", scanErr)
+			s.logger.Warn("error scanning path", "path", scanPath, "error", scanErr)
 			continue
 		}
 		allStructs = append(allStructs, structs...)
@@ -84,7 +84,19 @@ func (s *Scanner) ScanDependency(dep config.DependencyConfig) (*models.Dependenc
 		allHandlers = append(allHandlers, handlers...)
 	}
 
+	if len(allStructs) == 0 && len(allRoutes) == 0 && len(allHandlers) == 0 {
+		return nil, fmt.Errorf("AST scan found no structs, routes, or handlers for dependency %s — verify scan_paths in config", dep.Name)
+	}
+
 	framework := DetectFramework(absRepo, dirs)
+
+	s.logger.Info("AST extraction complete",
+		"dependency", dep.Name,
+		"structs", len(allStructs),
+		"routes", len(allRoutes),
+		"handlers", len(allHandlers),
+		"framework", framework,
+	)
 
 	scanOutput := &models.ScanOutput{
 		Repo:      dep.Name,

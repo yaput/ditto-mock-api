@@ -46,6 +46,9 @@ func buildResponsePrompt(endpoint models.Endpoint, req RequestContext) string {
 
 	sb.WriteString("\nRules:\n")
 	sb.WriteString("- Return ONLY valid JSON (no markdown, no explanation)\n")
+	sb.WriteString("- You MUST strictly follow the Response Schema if provided — use EXACTLY the field names (json_key values) from the schema\n")
+	sb.WriteString("- Do NOT add fields that are not in the schema\n")
+	sb.WriteString("- Do NOT wrap the response in extra objects not defined in the schema\n")
 	sb.WriteString("- Use realistic values (proper names, valid UUIDs, real-looking emails)\n")
 	sb.WriteString("- If path params are provided, reflect them in the response\n")
 	sb.WriteString("- For list endpoints, return 2-3 items\n")

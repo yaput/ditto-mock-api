@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 	"time"
 
@@ -116,6 +117,10 @@ For each route, determine:
 4. The expected success HTTP status code
 5. A brief description of what the endpoint does
 
+Match each route's handler to its handler summary via the "handler" and "name" fields.
+Use the "decodes" field to identify request body struct, and "encodes" field to identify response body struct.
+Then look up those struct names in the Extracted Structs and fully expand them.
+
 ## Output Format
 Return a JSON array:
 [
@@ -129,8 +134,11 @@ Return a JSON array:
   }
 ]
 
-Rules:
-- Resolve ALL nested struct types recursively into inline field definitions
+## CRITICAL Rules
+- You MUST fully resolve and inline ALL nested struct types recursively
+- Each field of type struct MUST have its "fields" array populated with the actual struct fields from Extracted Structs
+- Each field of type []StructType MUST have an "items" object with the struct's fields fully expanded
+- Do NOT return generic fields like {"name": "response", "type": "object"} without expanding the nested struct fields
 - Use json tag names as "json_key", not Go field names
 - Mark fields without "omitempty" as required: true
 - Infer formats from Go types: time.Time -> "date-time", uuid.UUID -> "uuid"
@@ -155,6 +163,9 @@ func parseEndpointsResponse(response string) ([]models.Endpoint, error) {
 	return endpoints, nil
 }
 
+// trailingCommaRe matches a comma followed by optional whitespace then ] or }.
+var trailingCommaRe = regexp.MustCompile(`,\s*([}\]])`)
+
 func cleanJSONResponse(s string) string {
 	s = strings.TrimSpace(s)
 	if i := strings.Index(s, "```json"); i >= 0 {
@@ -168,5 +179,8 @@ func cleanJSONResponse(s string) string {
 			s = s[:j]
 		}
 	}
-	return strings.TrimSpace(s)
+	s = strings.TrimSpace(s)
+	// Remove trailing commas before } or ] — a common LLM output defect.
+	s = trailingCommaRe.ReplaceAllString(s, "$1")
+	return s
 }

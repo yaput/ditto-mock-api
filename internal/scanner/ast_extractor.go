@@ -12,50 +12,80 @@ import (
 	"github.com/ditto-mock/ditto-mock-api/internal/models"
 )
 
-// ExtractFromDir parses all .go files in a directory (recursively) and extracts
+// ExtractFromPath parses Go files from a path (file or directory) and extracts
 // struct definitions, route registrations, and handler functions.
-func ExtractFromDir(dir string) (
+// If path is a single .go file, only that file is processed.
+// If path is a directory, all .go files are scanned recursively.
+func ExtractFromDir(path string) (
 	structs []models.ExtractedStruct,
 	routes []models.ExtractedRoute,
 	handlers []models.ExtractedHandler,
 	err error,
 ) {
-	err = filepath.Walk(dir, func(path string, info os.FileInfo, walkErr error) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+
+	// If the path is a single file, scan just that file.
+	if !info.IsDir() {
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil, nil, nil, nil
+		}
+		baseDir := filepath.Dir(path)
+		s, r, h, parseErr := extractFile(path, baseDir)
+		return s, r, h, parseErr
+	}
+
+	// Directory: walk recursively.
+	baseDir := path
+	err = filepath.Walk(baseDir, func(fpath string, finfo os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
-		if info.IsDir() {
-			base := filepath.Base(path)
-			if base == "vendor" || (strings.HasPrefix(base, ".") && path != dir) {
+		if finfo.IsDir() {
+			base := filepath.Base(fpath)
+			if base == "vendor" || (strings.HasPrefix(base, ".") && fpath != baseDir) {
 				return filepath.SkipDir
 			}
 			return nil
 		}
-		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+		if !strings.HasSuffix(fpath, ".go") || strings.HasSuffix(fpath, "_test.go") {
 			return nil
 		}
 
-		fset := token.NewFileSet()
-		node, parseErr := parser.ParseFile(fset, path, nil, parser.ParseComments)
+		s, r, h, parseErr := extractFile(fpath, baseDir)
 		if parseErr != nil {
-			return nil
+			return nil // skip unparseable files
 		}
-
-		relPath, _ := filepath.Rel(dir, path)
-
-		s := extractStructs(node, relPath)
 		structs = append(structs, s...)
-
-		r := extractRoutes(node, fset, relPath)
 		routes = append(routes, r...)
-
-		h := extractHandlers(node, fset, relPath)
 		handlers = append(handlers, h...)
-
 		return nil
 	})
 
 	return structs, routes, handlers, err
+}
+
+func extractFile(path, baseDir string) (
+	[]models.ExtractedStruct,
+	[]models.ExtractedRoute,
+	[]models.ExtractedHandler,
+	error,
+) {
+	fset := token.NewFileSet()
+	node, err := parser.ParseFile(fset, path, nil, parser.ParseComments)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+
+	relPath, _ := filepath.Rel(baseDir, path)
+
+	s := extractStructs(node, relPath)
+	r := extractRoutes(node, fset, relPath)
+	h := extractHandlers(node, fset, relPath)
+
+	return s, r, h, nil
 }
 
 func extractStructs(file *ast.File, relPath string) []models.ExtractedStruct {
@@ -231,13 +261,32 @@ func parseRouteCall(sel *ast.SelectorExpr, call *ast.CallExpr) (method, path, ha
 
 	if methodName == "HandleFunc" || methodName == "Handle" {
 		if len(call.Args) >= 2 {
-			path = extractStringLit(call.Args[0])
+			raw := extractStringLit(call.Args[0])
 			handler = exprToString(call.Args[1])
-			return "ANY", path, handler
+			// Go 1.22+ stdlib pattern: "METHOD /path"
+			if m, p, ok := parseStdlibPattern(raw); ok {
+				return m, p, handler
+			}
+			return "ANY", raw, handler
 		}
 	}
 
 	return "", "", ""
+}
+
+// parseStdlibPattern parses Go 1.22+ http.ServeMux patterns like "GET /path" or "POST /path/{id}".
+func parseStdlibPattern(pattern string) (method, path string, ok bool) {
+	pattern = strings.TrimSpace(pattern)
+	parts := strings.SplitN(pattern, " ", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	m := strings.ToUpper(strings.TrimSpace(parts[0]))
+	switch m {
+	case "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS":
+		return m, strings.TrimSpace(parts[1]), true
+	}
+	return "", "", false
 }
 
 func extractStringLit(expr ast.Expr) string {
@@ -316,6 +365,9 @@ func analyzeHandlerBody(body *ast.BlockStmt) (decodes, encodes string, statusCod
 		return "", "", nil
 	}
 
+	// Build a map of local variable names to their declared types.
+	localTypes := buildLocalTypeMap(body)
+
 	ast.Inspect(body, func(n ast.Node) bool {
 		call, ok := n.(*ast.CallExpr)
 		if !ok {
@@ -332,11 +384,11 @@ func analyzeHandlerBody(body *ast.BlockStmt) (decodes, encodes string, statusCod
 		switch name {
 		case "Decode", "Unmarshal", "Bind", "ShouldBindJSON", "BindJSON", "ShouldBind":
 			if len(call.Args) > 0 {
-				decodes = lastTypeName(call.Args[len(call.Args)-1])
+				decodes = resolveTypeName(call.Args[len(call.Args)-1], localTypes)
 			}
 		case "Encode", "Marshal", "JSON", "Render", "JSONP":
 			if len(call.Args) > 0 {
-				encodes = lastTypeName(call.Args[len(call.Args)-1])
+				encodes = resolveTypeName(call.Args[len(call.Args)-1], localTypes)
 			}
 		case "WriteHeader":
 			if len(call.Args) > 0 {
@@ -358,13 +410,67 @@ func analyzeHandlerBody(body *ast.BlockStmt) (decodes, encodes string, statusCod
 	return decodes, encodes, statusCodes
 }
 
-func lastTypeName(expr ast.Expr) string {
+// buildLocalTypeMap extracts variable name → type mappings from the function body.
+// Handles: "var x Type", "x := Type{...}", "x := pkg.Func(...)" patterns.
+func buildLocalTypeMap(body *ast.BlockStmt) map[string]string {
+	types := make(map[string]string)
+
+	ast.Inspect(body, func(n ast.Node) bool {
+		switch stmt := n.(type) {
+		case *ast.DeclStmt:
+			// var x SomeType
+			genDecl, ok := stmt.Decl.(*ast.GenDecl)
+			if !ok {
+				return true
+			}
+			for _, spec := range genDecl.Specs {
+				vs, ok := spec.(*ast.ValueSpec)
+				if !ok || vs.Type == nil {
+					continue
+				}
+				typeName := typeToString(vs.Type)
+				for _, name := range vs.Names {
+					types[name.Name] = typeName
+				}
+			}
+		case *ast.AssignStmt:
+			// x := Type{...} or x := someExpr
+			for i, lhs := range stmt.Lhs {
+				ident, ok := lhs.(*ast.Ident)
+				if !ok || i >= len(stmt.Rhs) {
+					continue
+				}
+				rhs := stmt.Rhs[i]
+				switch r := rhs.(type) {
+				case *ast.CompositeLit:
+					if r.Type != nil {
+						types[ident.Name] = typeToString(r.Type)
+					}
+				case *ast.UnaryExpr:
+					if cl, ok := r.X.(*ast.CompositeLit); ok && cl.Type != nil {
+						types[ident.Name] = typeToString(cl.Type)
+					}
+				}
+			}
+		}
+		return true
+	})
+
+	return types
+}
+
+// resolveTypeName extracts the type name from an expression, using the local
+// variable type map to resolve variable references to their declared types.
+func resolveTypeName(expr ast.Expr, localTypes map[string]string) string {
 	switch e := expr.(type) {
 	case *ast.UnaryExpr:
-		return lastTypeName(e.X)
+		return resolveTypeName(e.X, localTypes)
 	case *ast.CompositeLit:
 		return typeToString(e.Type)
 	case *ast.Ident:
+		if t, ok := localTypes[e.Name]; ok {
+			return t
+		}
 		return e.Name
 	case *ast.SelectorExpr:
 		return exprToString(e)

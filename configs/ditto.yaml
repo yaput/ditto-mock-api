@@ -7,9 +7,9 @@ llm:
   model: "gpt-4o-mini"
   api_key: "${OPENAI_API_KEY}"
   temperature: 0.7
-  max_tokens: 2048
-  timeout: 30s
-  max_retries: 2
+  max_tokens: 4096
+  timeout: 120s
+  max_retries: 3
 
 cache:
   enabled: true
@@ -34,9 +34,6 @@ dependencies:
   - name: user-service
     prefix: /api/users
     repo_path: ../user-service
-    scan_paths:
-      - internal/handler
-      - internal/model
   # - name: order-service
   #   prefix: /api/orders
   #   repo_path: ../order-service
