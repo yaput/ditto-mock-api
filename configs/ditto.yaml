@@ -7,8 +7,9 @@ llm:
   model: "gpt-4o-mini"
   api_key: "${OPENAI_API_KEY}"
   temperature: 0.7
-  max_tokens: 4096
-  timeout: 120s
+  max_tokens: 16384
+  max_context_tokens: 128000
+  timeout: 300s
   max_retries: 3
 
 cache:
@@ -30,12 +31,24 @@ logging:
   level: "info"
   format: "text"
 
-dependencies:
-  - name: user-service
-    prefix: /api/users
-    repo_path: ../user-service
-  # - name: order-service
-  #   prefix: /api/orders
-  #   repo_path: ../order-service
-  #   scan_paths:
-  #     - .
+# Auto-discover dependencies by scanning a service's go.mod for internal org imports
+# and HTTP client config patterns (e.g., Config.XxxServiceAddress).
+# Discovered deps are merged with explicit dependencies below (explicit takes precedence).
+discovery:
+  enabled: true
+  service_repo: "../talkroom-bff"
+  org_prefixes:
+    - "github.com/zeals-co-ltd/"
+#   workspace_root: "../"
+#   repo_map:                          # optional: explicit overrides for repo locations
+#     "github.com/zeals-co-ltd/talkroom-ticketing": "../custom-path/ticketing"
+  http_discovery:
+    enabled: true
+    address_suffix: "ServiceAddress"   # strips this suffix from Config.XxxServiceAddress to derive service names
+
+dependencies: []
+  # - name: user-service
+  #   prefix: /api/users
+  #   repo_path: ../user-service
+
+

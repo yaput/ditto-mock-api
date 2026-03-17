@@ -442,3 +442,165 @@ func TestMockHandler_WithBody(t *testing.T) {
 		t.Errorf("unexpected body: %s", string(respBody))
 	}
 }
+
+// ---- Endpoints ----
+
+func TestEndpoints_List(t *testing.T) {
+	srv := testServer(&mockGenerator{}, newMockCache())
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/_ditto/endpoints", nil)
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	var resp struct {
+		Total     int `json:"total"`
+		Endpoints []struct {
+			Method      string `json:"method"`
+			Path        string `json:"path"`
+			MockURL     string `json:"mock_url"`
+			Dependency  string `json:"dependency"`
+			Description string `json:"description"`
+			StatusCode  int    `json:"status_code"`
+			HasRequest  bool   `json:"has_request_schema"`
+			HasResponse bool   `json:"has_response_schema"`
+		} `json:"endpoints"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode error: %v", err)
+	}
+	if resp.Total != 2 {
+		t.Fatalf("expected 2 endpoints, got %d", resp.Total)
+	}
+
+	// Endpoints should have prefix applied in mock_url.
+	found := false
+	for _, ep := range resp.Endpoints {
+		if ep.Method == "GET" && ep.Path == "/users/{id}" {
+			found = true
+			if ep.MockURL != "/users/users/{id}" {
+				t.Errorf("expected mock_url /users/users/{id}, got %s", ep.MockURL)
+			}
+			if ep.Dependency != "user-service" {
+				t.Errorf("expected dependency user-service, got %s", ep.Dependency)
+			}
+		}
+	}
+	if !found {
+		t.Error("GET /users/{id} endpoint not found")
+	}
+}
+
+func TestEndpoints_FilterByDependency(t *testing.T) {
+	// Create server with two dependencies.
+	cfg := testConfig()
+	cfg.Dependencies = append(cfg.Dependencies, config.DependencyConfig{Name: "order-service", Prefix: "/orders"})
+	registries := []models.DependencyRegistry{
+		{
+			Dependency: "user-service",
+			Endpoints: []models.Endpoint{
+				{Method: "GET", Path: "/users/{id}", StatusCode: 200},
+			},
+		},
+		{
+			Dependency: "order-service",
+			Endpoints: []models.Endpoint{
+				{Method: "GET", Path: "/orders/{id}", StatusCode: 200},
+				{Method: "POST", Path: "/orders", StatusCode: 201},
+			},
+		},
+	}
+	prefixes := map[string]string{"user-service": "/users", "order-service": "/orders"}
+	m := matcher.New(registries, prefixes)
+	srv := New(cfg, m, newMockCache(), &mockGenerator{}, registries, testLogger())
+
+	// Filter by order-service.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/_ditto/endpoints?dependency=order-service", nil)
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("expected 200, got %d", rec.Code)
+	}
+
+	var resp struct {
+		Total     int              `json:"total"`
+		Endpoints []map[string]any `json:"endpoints"`
+	}
+	json.NewDecoder(rec.Body).Decode(&resp)
+	if resp.Total != 2 {
+		t.Fatalf("expected 2 order-service endpoints, got %d", resp.Total)
+	}
+	for _, ep := range resp.Endpoints {
+		if ep["dependency"] != "order-service" {
+			t.Errorf("expected order-service, got %v", ep["dependency"])
+		}
+	}
+}
+
+func TestEndpoints_SchemaStatus(t *testing.T) {
+	cfg := testConfig()
+	registries := []models.DependencyRegistry{
+		{
+			Dependency: "user-service",
+			Endpoints: []models.Endpoint{
+				{
+					Method:     "POST",
+					Path:       "/users",
+					StatusCode: 201,
+					RequestBody: &models.BodySchema{
+						Type:   "object",
+						Fields: []models.FieldSchema{{Name: "name", Type: "string"}},
+					},
+					ResponseBody: &models.BodySchema{
+						Type:   "object",
+						Fields: []models.FieldSchema{{Name: "id", Type: "string"}},
+					},
+				},
+				{
+					Method:     "GET",
+					Path:       "/users/{id}",
+					StatusCode: 200,
+				},
+			},
+		},
+	}
+	prefixes := map[string]string{"user-service": "/users"}
+	m := matcher.New(registries, prefixes)
+	srv := New(cfg, m, newMockCache(), &mockGenerator{}, registries, testLogger())
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/_ditto/endpoints", nil)
+	srv.httpServer.Handler.ServeHTTP(rec, req)
+
+	var resp struct {
+		Endpoints []struct {
+			Method      string `json:"method"`
+			Path        string `json:"path"`
+			HasRequest  bool   `json:"has_request_schema"`
+			HasResponse bool   `json:"has_response_schema"`
+		} `json:"endpoints"`
+	}
+	json.NewDecoder(rec.Body).Decode(&resp)
+
+	for _, ep := range resp.Endpoints {
+		if ep.Method == "POST" && ep.Path == "/users" {
+			if !ep.HasRequest {
+				t.Error("POST /users should have request schema")
+			}
+			if !ep.HasResponse {
+				t.Error("POST /users should have response schema")
+			}
+		}
+		if ep.Method == "GET" && ep.Path == "/users/{id}" {
+			if ep.HasRequest {
+				t.Error("GET /users/{id} should not have request schema")
+			}
+			if ep.HasResponse {
+				t.Error("GET /users/{id} should not have response schema")
+			}
+		}
+	}
+}

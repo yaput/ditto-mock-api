@@ -26,15 +26,12 @@ func TestChatCompletion_Success(t *testing.T) {
 			t.Errorf("expected 2 messages, got %d", len(req.Messages))
 		}
 
-		resp := chatResponse{
-			Choices: []struct {
-				Message struct {
-					Content string `json:"content"`
-				} `json:"message"`
-			}{
-				{Message: struct {
-					Content string `json:"content"`
-				}{Content: `{"id":"123"}`}},
+		resp := map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{
+					"message":       map[string]string{"content": `{"id":"123"}`},
+					"finish_reason": "stop",
+				},
 			},
 		}
 		json.NewEncoder(w).Encode(resp)
@@ -85,5 +82,57 @@ func TestNewOpenAIClient_Defaults(t *testing.T) {
 	}
 	if c.client != http.DefaultClient {
 		t.Error("expected default http client")
+	}
+}
+
+func TestChatCompletion_Truncated(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		resp := map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{
+					"message":       map[string]string{"content": `[{"method":"GET","path":"/use`},
+					"finish_reason": "length",
+				},
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	client := NewOpenAIClient("test-key", "gpt-4o-mini", 0.7, 100, WithBaseURL(srv.URL))
+	content, err := client.ChatCompletion(context.Background(), "system", "user")
+
+	if err == nil {
+		t.Fatal("expected ErrResponseTruncated")
+	}
+	if err != ErrResponseTruncated {
+		t.Fatalf("expected ErrResponseTruncated, got: %v", err)
+	}
+	if content != `[{"method":"GET","path":"/use` {
+		t.Errorf("expected partial content, got: %s", content)
+	}
+}
+
+func TestChatCompletion_FinishReasonStop(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		resp := map[string]interface{}{
+			"choices": []map[string]interface{}{
+				{
+					"message":       map[string]string{"content": `[{"id":"1"}]`},
+					"finish_reason": "stop",
+				},
+			},
+		}
+		json.NewEncoder(w).Encode(resp)
+	}))
+	defer srv.Close()
+
+	client := NewOpenAIClient("test-key", "gpt-4o-mini", 0.7, 1000, WithBaseURL(srv.URL))
+	content, err := client.ChatCompletion(context.Background(), "system", "user")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if content != `[{"id":"1"}]` {
+		t.Errorf("unexpected content: %s", content)
 	}
 }

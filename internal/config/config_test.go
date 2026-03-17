@@ -152,6 +152,63 @@ dependencies: []
 	}
 }
 
+func TestParse_EmptyDepsWithDiscoveryEnabled(t *testing.T) {
+	data := []byte(`
+llm:
+  api_key: "sk-test"
+discovery:
+  enabled: true
+  service_repo: "../my-service"
+  org_prefixes:
+    - "github.com/zeals-co-ltd/"
+dependencies: []
+`)
+	cfg, err := Parse(data)
+	if err != nil {
+		t.Fatalf("expected no error when discovery enabled, got: %v", err)
+	}
+	if !cfg.Discovery.Enabled {
+		t.Error("expected discovery.enabled to be true")
+	}
+	if cfg.Discovery.ServiceRepo != "../my-service" {
+		t.Errorf("expected service_repo ../my-service, got %s", cfg.Discovery.ServiceRepo)
+	}
+	if cfg.Discovery.WorkspaceRoot != "../" {
+		t.Errorf("expected default workspace_root ../, got %s", cfg.Discovery.WorkspaceRoot)
+	}
+}
+
+func TestParse_DiscoveryMissingServiceRepo(t *testing.T) {
+	data := []byte(`
+llm:
+  api_key: "sk-test"
+discovery:
+  enabled: true
+  org_prefixes:
+    - "github.com/zeals-co-ltd/"
+dependencies: []
+`)
+	_, err := Parse(data)
+	if err == nil {
+		t.Fatal("expected error for missing service_repo")
+	}
+}
+
+func TestParse_DiscoveryMissingOrgPrefixes(t *testing.T) {
+	data := []byte(`
+llm:
+  api_key: "sk-test"
+discovery:
+  enabled: true
+  service_repo: "../my-service"
+dependencies: []
+`)
+	_, err := Parse(data)
+	if err == nil {
+		t.Fatal("expected error for missing org_prefixes")
+	}
+}
+
 func TestParse_DuplicateDependencyName(t *testing.T) {
 	data := []byte(`
 llm:

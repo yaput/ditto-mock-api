@@ -3,6 +3,7 @@ package scanner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/ditto-mock/ditto-mock-api/internal/config"
+	"github.com/ditto-mock/ditto-mock-api/internal/llm"
 	"github.com/ditto-mock/ditto-mock-api/internal/models"
 )
 
@@ -35,13 +37,65 @@ func NewLLMAnalyzer(client LLMClient, cfg config.LLMConfig, logger *slog.Logger)
 }
 
 // Analyze sends the raw scan output to the LLM and returns structured endpoints.
+// If the prompt exceeds the context window, the scan is automatically chunked
+// into smaller pieces that each fit within the token limit.
 func (a *LLMAnalyzer) Analyze(scan *models.ScanOutput) ([]models.Endpoint, error) {
+	// Reserve tokens for system prompt, response, and overhead.
+	maxPromptTokens := a.cfg.MaxContextTokens - a.cfg.MaxTokens - promptOverhead
+	if maxPromptTokens < 4000 {
+		maxPromptTokens = 4000
+	}
+
+	chunks := ChunkScanOutput(scan, maxPromptTokens, a.cfg.MaxTokens)
+
+	a.logger.Info("analysis chunking decision",
+		"repo", scan.Repo,
+		"total_routes", len(scan.Routes),
+		"total_structs", len(scan.Structs),
+		"total_handlers", len(scan.Handlers),
+		"chunks", len(chunks),
+		"max_prompt_tokens", maxPromptTokens,
+	)
+
+	var allEndpoints []models.Endpoint
+	for i, chunk := range chunks {
+		a.logger.Info("analyzing chunk",
+			"chunk", fmt.Sprintf("%d/%d", i+1, len(chunks)),
+			"routes", len(chunk.Routes),
+			"structs", len(chunk.Structs),
+			"handlers", len(chunk.Handlers),
+		)
+
+		endpoints, err := a.analyzeChunk(chunk)
+		if err != nil {
+			return nil, fmt.Errorf("analyzing chunk %d/%d: %w", i+1, len(chunks), err)
+		}
+		allEndpoints = append(allEndpoints, endpoints...)
+	}
+
+	if len(allEndpoints) == 0 {
+		return nil, fmt.Errorf("LLM returned no endpoints across %d chunks", len(chunks))
+	}
+
+	return allEndpoints, nil
+}
+
+// analyzeChunk sends a single chunk to the LLM with retries.
+// If the response is truncated, it attempts JSON repair to salvage partial results.
+// If repair fails and the chunk has multiple routes, it splits and retries recursively.
+func (a *LLMAnalyzer) analyzeChunk(scan *models.ScanOutput) ([]models.Endpoint, error) {
 	prompt, err := buildAnalysisPrompt(scan)
 	if err != nil {
 		return nil, fmt.Errorf("building analysis prompt: %w", err)
 	}
 
-	systemPrompt := "You are an expert Go developer analyzing a microservice codebase. " +
+	a.logger.Debug("chunk prompt stats",
+		"repo", scan.Repo,
+		"prompt_chars", len(prompt),
+		"estimated_tokens", estimateTokens(prompt),
+	)
+
+	sysPrompt := "You are an expert Go developer analyzing a microservice codebase. " +
 		"Your job is to produce a structured endpoint registry from extracted code artifacts. " +
 		"Return ONLY valid JSON — no markdown, no explanation, no wrapping."
 
@@ -59,13 +113,43 @@ func (a *LLMAnalyzer) Analyze(scan *models.ScanOutput) ([]models.Endpoint, error
 			"repo", scan.Repo,
 		)
 
-		response, callErr := a.client.ChatCompletion(ctx, systemPrompt, prompt)
+		response, callErr := a.client.ChatCompletion(ctx, sysPrompt, prompt)
 		cancel()
 
-		if callErr != nil {
+		truncated := errors.Is(callErr, llm.ErrResponseTruncated)
+		if callErr != nil && !truncated {
 			lastErr = callErr
 			a.logger.Warn("LLM call failed", "attempt", attempt+1, "error", callErr)
 			time.Sleep(time.Duration(attempt+1) * time.Second)
+			continue
+		}
+
+		if truncated {
+			a.logger.Warn("LLM response truncated (max_tokens reached)",
+				"attempt", attempt+1,
+				"response_len", len(response),
+				"routes", len(scan.Routes),
+			)
+			// Try to repair the truncated JSON and salvage partial results.
+			endpoints, repairErr := repairTruncatedJSON(response)
+			if repairErr == nil && len(endpoints) > 0 {
+				a.logger.Info("salvaged partial endpoints from truncated response",
+					"salvaged", len(endpoints),
+					"routes_in_chunk", len(scan.Routes),
+				)
+				return endpoints, nil
+			}
+
+			// Repair failed — if we have multiple routes, split the chunk in half and recurse.
+			if len(scan.Routes) > 1 {
+				a.logger.Info("splitting chunk due to truncation",
+					"routes", len(scan.Routes),
+				)
+				return a.splitAndRetry(scan)
+			}
+
+			// Single route that still overflows — nothing more we can do.
+			lastErr = fmt.Errorf("response truncated for single-route chunk and repair failed")
 			continue
 		}
 
@@ -82,6 +166,45 @@ func (a *LLMAnalyzer) Analyze(scan *models.ScanOutput) ([]models.Endpoint, error
 	}
 
 	return nil, fmt.Errorf("LLM analysis failed after %d attempts: %w", maxRetries+1, lastErr)
+}
+
+// splitAndRetry splits a chunk in half and analyzes each half independently.
+func (a *LLMAnalyzer) splitAndRetry(scan *models.ScanOutput) ([]models.Endpoint, error) {
+	mid := len(scan.Routes) / 2
+
+	structIndex := buildStructIndex(scan.Structs)
+	handlerIndex := make(map[string]models.ExtractedHandler, len(scan.Handlers))
+	for _, h := range scan.Handlers {
+		handlerIndex[h.Name] = h
+	}
+
+	buildHalf := func(routes []models.ExtractedRoute) *models.ScanOutput {
+		handlers := collectHandlers(routes, handlerIndex)
+		refs := referencedStructNames(handlers, structIndex)
+		structs := collectStructs(refs, structIndex)
+		return &models.ScanOutput{
+			Repo:      scan.Repo,
+			Framework: scan.Framework,
+			Routes:    routes,
+			Handlers:  handlers,
+			Structs:   structs,
+		}
+	}
+
+	firstHalf := buildHalf(scan.Routes[:mid])
+	secondHalf := buildHalf(scan.Routes[mid:])
+
+	ep1, err := a.analyzeChunk(firstHalf)
+	if err != nil {
+		return nil, fmt.Errorf("analyzing first half after split: %w", err)
+	}
+
+	ep2, err := a.analyzeChunk(secondHalf)
+	if err != nil {
+		return nil, fmt.Errorf("analyzing second half after split: %w", err)
+	}
+
+	return append(ep1, ep2...), nil
 }
 
 func buildAnalysisPrompt(scan *models.ScanOutput) (string, error) {
@@ -161,6 +284,46 @@ func parseEndpointsResponse(response string) ([]models.Endpoint, error) {
 	}
 
 	return endpoints, nil
+}
+
+// repairTruncatedJSON attempts to extract valid endpoint objects from truncated JSON.
+// It finds the last complete object in the array by searching backwards for "},"
+// or "}" followed by "]" that forms valid JSON when the array is closed.
+func repairTruncatedJSON(response string) ([]models.Endpoint, error) {
+	cleaned := cleanJSONResponse(response)
+
+	// Find the start of the array.
+	arrStart := strings.Index(cleaned, "[")
+	if arrStart < 0 {
+		return nil, fmt.Errorf("no JSON array found in truncated response")
+	}
+
+	// Try progressively shorter suffixes, looking for a point where
+	// closing brackets produces valid JSON.
+	content := cleaned[arrStart:]
+
+	// Strategy: find the last complete object by looking for "}," or "}" patterns
+	// from the end and try closing the array there.
+	for i := len(content) - 1; i > 0; i-- {
+		if content[i] != '}' {
+			continue
+		}
+		// Try closing the array right after this '}'.
+		candidate := content[:i+1]
+		// Strip any trailing comma.
+		candidate = strings.TrimRight(candidate, ", \t\n\r")
+		if !strings.HasSuffix(candidate, "}") {
+			continue
+		}
+		candidate += "]"
+
+		var endpoints []models.Endpoint
+		if err := json.Unmarshal([]byte(candidate), &endpoints); err == nil && len(endpoints) > 0 {
+			return endpoints, nil
+		}
+	}
+
+	return nil, fmt.Errorf("could not repair truncated JSON")
 }
 
 // trailingCommaRe matches a comma followed by optional whitespace then ] or }.

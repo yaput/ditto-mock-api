@@ -83,6 +83,14 @@ func main() {
 
 	// Create scan callback for admin re-scan.
 	scanFunc := func(ctx context.Context) ([]models.DependencyRegistry, error) {
+		// Re-run discovery in case go.mod changed.
+		if _, discErr := sc.RunDiscovery(); discErr != nil {
+			logger.Error("re-scan discovery failed", "error", discErr)
+		}
+		// Rebuild prefixes from (possibly updated) dependencies.
+		for _, dep := range cfg.Dependencies {
+			prefixes[dep.Name] = dep.Prefix
+		}
 		regs, scanErr := sc.ScanAll()
 		if scanErr != nil {
 			return nil, scanErr

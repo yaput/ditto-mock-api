@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ditto-mock/ditto-mock-api/internal/config"
+	"github.com/ditto-mock/ditto-mock-api/internal/llm"
 	"github.com/ditto-mock/ditto-mock-api/internal/models"
 )
 
@@ -664,6 +665,153 @@ func TestParseEndpointsResponse_InvalidJSON(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for invalid JSON")
 	}
+}
+
+// =============================================================================
+// Truncated JSON Repair Tests
+// =============================================================================
+
+func TestRepairTruncatedJSON_CompleteObject(t *testing.T) {
+	// One complete endpoint, then truncation mid-second.
+	truncated := `[{"method":"GET","path":"/users","description":"List users","request_body":null,"response_body":null,"status_code":200},{"method":"POST","path":"/use`
+	eps, err := repairTruncatedJSON(truncated)
+	if err != nil {
+		t.Fatalf("repair failed: %v", err)
+	}
+	if len(eps) != 1 {
+		t.Fatalf("expected 1 salvaged endpoint, got %d", len(eps))
+	}
+	if eps[0].Method != "GET" {
+		t.Errorf("expected GET, got %s", eps[0].Method)
+	}
+}
+
+func TestRepairTruncatedJSON_MultipleComplete(t *testing.T) {
+	// Two complete endpoints, truncation mid-third.
+	truncated := `[{"method":"GET","path":"/a","description":"A","request_body":null,"response_body":null,"status_code":200},{"method":"POST","path":"/b","description":"B","request_body":null,"response_body":null,"status_code":201},{"method":"DEL`
+	eps, err := repairTruncatedJSON(truncated)
+	if err != nil {
+		t.Fatalf("repair failed: %v", err)
+	}
+	if len(eps) != 2 {
+		t.Fatalf("expected 2 salvaged endpoints, got %d", len(eps))
+	}
+}
+
+func TestRepairTruncatedJSON_NoCompleteObject(t *testing.T) {
+	// Truncated before any object completes.
+	truncated := `[{"method":"GET","path":"/use`
+	_, err := repairTruncatedJSON(truncated)
+	if err == nil {
+		t.Fatal("expected error for no complete objects")
+	}
+}
+
+func TestRepairTruncatedJSON_NoArray(t *testing.T) {
+	_, err := repairTruncatedJSON("some random text without json")
+	if err == nil {
+		t.Fatal("expected error for missing array")
+	}
+}
+
+func TestRepairTruncatedJSON_MarkdownWrapped(t *testing.T) {
+	truncated := "```json\n" + `[{"method":"GET","path":"/x","description":"X","request_body":null,"response_body":null,"status_code":200},{"method":"PO`
+	eps, err := repairTruncatedJSON(truncated)
+	if err != nil {
+		t.Fatalf("repair failed: %v", err)
+	}
+	if len(eps) != 1 {
+		t.Fatalf("expected 1 salvaged endpoint, got %d", len(eps))
+	}
+}
+
+// =============================================================================
+// Truncation-Aware Analyzer Tests
+// =============================================================================
+
+func TestLLMAnalyzer_Analyze_TruncationRepair(t *testing.T) {
+	// Simulate truncated response with one complete endpoint.
+	truncated := `[{"method":"GET","path":"/users","description":"List users","request_body":null,"response_body":null,"status_code":200},{"method":"POST","path":"/use`
+	client := &mockLLMClient{
+		response: truncated,
+		err:      llm.ErrResponseTruncated,
+	}
+	cfg := config.LLMConfig{
+		Timeout:    10 * time.Second,
+		MaxRetries: 0,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	analyzer := NewLLMAnalyzer(client, cfg, logger)
+
+	scan := &models.ScanOutput{
+		Repo:      "test-service",
+		Framework: "chi",
+		Routes:    []models.ExtractedRoute{{Method: "GET", Path: "/users", Handler: "ListUsers"}},
+	}
+
+	endpoints, err := analyzer.Analyze(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(endpoints) != 1 {
+		t.Fatalf("expected 1 salvaged endpoint, got %d", len(endpoints))
+	}
+	if endpoints[0].Method != "GET" {
+		t.Errorf("expected GET, got %s", endpoints[0].Method)
+	}
+}
+
+func TestLLMAnalyzer_Analyze_TruncationSplit(t *testing.T) {
+	// Simulate a mock that returns truncation on the first call (with 2 routes),
+	// then succeeds on each half.
+	callCount := 0
+	client := &dynamicMockLLMClient{
+		handler: func(ctx context.Context, sys, user string) (string, error) {
+			callCount++
+			if callCount == 1 {
+				// First call: truncated, unrepairable (no complete objects).
+				return `[{"method":"GET","path":"/use`, llm.ErrResponseTruncated
+			}
+			// Subsequent calls (split halves): succeed.
+			return `[{"method":"GET","path":"/items","description":"List","request_body":null,"response_body":null,"status_code":200}]`, nil
+		},
+	}
+	cfg := config.LLMConfig{
+		Timeout:    10 * time.Second,
+		MaxRetries: 0,
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
+	analyzer := NewLLMAnalyzer(client, cfg, logger)
+
+	scan := &models.ScanOutput{
+		Repo:      "test-service",
+		Framework: "chi",
+		Routes: []models.ExtractedRoute{
+			{Method: "GET", Path: "/users", Handler: "ListUsers"},
+			{Method: "GET", Path: "/items", Handler: "ListItems"},
+		},
+	}
+
+	endpoints, err := analyzer.Analyze(scan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(endpoints) != 2 {
+		t.Fatalf("expected 2 endpoints from split, got %d", len(endpoints))
+	}
+	// Should have been called 3 times: 1 initial (truncated) + 2 halves.
+	if callCount != 3 {
+		t.Errorf("expected 3 LLM calls, got %d", callCount)
+	}
+}
+
+// dynamicMockLLMClient allows per-call response control.
+type dynamicMockLLMClient struct {
+	handler func(ctx context.Context, sys, user string) (string, error)
+}
+
+func (m *dynamicMockLLMClient) ChatCompletion(ctx context.Context, sys, user string) (string, error) {
+	return m.handler(ctx, sys, user)
 }
 
 // =============================================================================

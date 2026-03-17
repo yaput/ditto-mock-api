@@ -72,6 +72,7 @@ func New(
 	mux.HandleFunc("DELETE /_ditto/cache/", s.handleCachePurgeDep)
 	mux.HandleFunc("GET /_ditto/cache/stats", s.handleCacheStats)
 	mux.HandleFunc("GET /_ditto/config", s.handleConfig)
+	mux.HandleFunc("GET /_ditto/endpoints", s.handleEndpoints)
 
 	// Catch-all for mock requests (SRV-2)
 	mux.HandleFunc("/", s.handleMock)

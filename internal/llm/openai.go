@@ -67,11 +67,16 @@ type chatResponse struct {
 		Message struct {
 			Content string `json:"content"`
 		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
 }
+
+// ErrResponseTruncated is returned when the LLM response was cut short
+// due to the max_tokens limit (finish_reason == "length").
+var ErrResponseTruncated = fmt.Errorf("LLM response truncated (max_tokens reached)")
 
 // ChatCompletion sends a chat completion request and returns the response text.
 func (c *OpenAIClient) ChatCompletion(ctx context.Context, systemPrompt, userPrompt string) (string, error) {
@@ -126,5 +131,10 @@ func (c *OpenAIClient) ChatCompletion(ctx context.Context, systemPrompt, userPro
 		return "", fmt.Errorf("openai returned no choices")
 	}
 
-	return chatResp.Choices[0].Message.Content, nil
+	content := chatResp.Choices[0].Message.Content
+	if chatResp.Choices[0].FinishReason == "length" {
+		return content, ErrResponseTruncated
+	}
+
+	return content, nil
 }

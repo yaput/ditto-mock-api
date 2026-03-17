@@ -17,6 +17,7 @@ type Config struct {
 	LLM          LLMConfig          `yaml:"llm"`
 	Cache        CacheConfig        `yaml:"cache"`
 	Scanner      ScannerConfig      `yaml:"scanner"`
+	Discovery    DiscoveryConfig    `yaml:"discovery"`
 	Dependencies []DependencyConfig `yaml:"dependencies"`
 	Logging      LoggingConfig      `yaml:"logging"`
 }
@@ -29,13 +30,14 @@ type ServerConfig struct {
 
 // LLMConfig holds LLM provider settings.
 type LLMConfig struct {
-	Provider    string        `yaml:"provider"`
-	Model       string        `yaml:"model"`
-	APIKey      string        `yaml:"api_key"`
-	Temperature float64       `yaml:"temperature"`
-	MaxTokens   int           `yaml:"max_tokens"`
-	Timeout     time.Duration `yaml:"timeout"`
-	MaxRetries  int           `yaml:"max_retries"`
+	Provider         string        `yaml:"provider"`
+	Model            string        `yaml:"model"`
+	APIKey           string        `yaml:"api_key"`
+	Temperature      float64       `yaml:"temperature"`
+	MaxTokens        int           `yaml:"max_tokens"`
+	MaxContextTokens int           `yaml:"max_context_tokens"`
+	Timeout          time.Duration `yaml:"timeout"`
+	MaxRetries       int           `yaml:"max_retries"`
 }
 
 // CacheConfig holds cache settings.
@@ -64,6 +66,23 @@ type DependencyConfig struct {
 type LoggingConfig struct {
 	Level  string `yaml:"level"`
 	Format string `yaml:"format"`
+}
+
+// DiscoveryConfig controls automatic dependency discovery from go.mod and HTTP clients.
+type DiscoveryConfig struct {
+	Enabled       bool                `yaml:"enabled"`
+	ServiceRepo   string              `yaml:"service_repo"`
+	OrgPrefixes   []string            `yaml:"org_prefixes"`
+	WorkspaceRoot string              `yaml:"workspace_root"`
+	RepoMap       map[string]string   `yaml:"repo_map"`
+	HTTPDiscovery HTTPDiscoveryConfig `yaml:"http_discovery"`
+}
+
+// HTTPDiscoveryConfig controls scanning for HTTP service dependencies
+// by finding config address patterns (e.g., Config.XxxServiceAddress) in source code.
+type HTTPDiscoveryConfig struct {
+	Enabled       bool   `yaml:"enabled"`
+	AddressSuffix string `yaml:"address_suffix"` // e.g., "ServiceAddress" — suffix to strip from config field names
 }
 
 // envVarPattern matches ${VAR_NAME} in config values.
@@ -121,10 +140,13 @@ func applyDefaults(cfg *Config) {
 		cfg.LLM.Temperature = 0.7
 	}
 	if cfg.LLM.MaxTokens == 0 {
-		cfg.LLM.MaxTokens = 4096
+		cfg.LLM.MaxTokens = 16384
+	}
+	if cfg.LLM.MaxContextTokens == 0 {
+		cfg.LLM.MaxContextTokens = 120000
 	}
 	if cfg.LLM.Timeout == 0 {
-		cfg.LLM.Timeout = 30 * time.Second
+		cfg.LLM.Timeout = 5 * time.Minute
 	}
 	if cfg.LLM.MaxRetries == 0 {
 		cfg.LLM.MaxRetries = 2
@@ -147,6 +169,12 @@ func applyDefaults(cfg *Config) {
 	if cfg.Logging.Format == "" {
 		cfg.Logging.Format = "text"
 	}
+	if cfg.Discovery.WorkspaceRoot == "" {
+		cfg.Discovery.WorkspaceRoot = "../"
+	}
+	if cfg.Discovery.HTTPDiscovery.AddressSuffix == "" {
+		cfg.Discovery.HTTPDiscovery.AddressSuffix = "ServiceAddress"
+	}
 }
 
 // validate checks required fields.
@@ -154,8 +182,16 @@ func validate(cfg *Config) error {
 	if cfg.LLM.APIKey == "" {
 		return fmt.Errorf("llm.api_key is required (set OPENAI_API_KEY env var)")
 	}
-	if len(cfg.Dependencies) == 0 {
-		return fmt.Errorf("at least one dependency must be configured")
+	if len(cfg.Dependencies) == 0 && !cfg.Discovery.Enabled {
+		return fmt.Errorf("at least one dependency must be configured (or enable discovery)")
+	}
+	if cfg.Discovery.Enabled {
+		if cfg.Discovery.ServiceRepo == "" {
+			return fmt.Errorf("discovery.service_repo is required when discovery is enabled")
+		}
+		if len(cfg.Discovery.OrgPrefixes) == 0 {
+			return fmt.Errorf("discovery.org_prefixes is required when discovery is enabled")
+		}
 	}
 	seen := make(map[string]bool)
 	for i, dep := range cfg.Dependencies {

@@ -122,9 +122,55 @@ func (s *Scanner) ScanDependency(dep config.DependencyConfig) (*models.Dependenc
 	return reg, nil
 }
 
+// RunDiscovery discovers dependencies from go.mod and merges them into the config.
+// It returns the list of newly discovered DependencyConfig entries.
+func (s *Scanner) RunDiscovery() ([]config.DependencyConfig, error) {
+	if !s.cfg.Discovery.Enabled {
+		return nil, nil
+	}
+
+	discovered, err := DiscoverDependencies(s.cfg.Discovery)
+	if err != nil {
+		return nil, fmt.Errorf("running discovery: %w", err)
+	}
+
+	if len(discovered) == 0 {
+		s.logger.Info("discovery found no matching dependencies")
+		return nil, nil
+	}
+
+	// Merge: skip discovered deps that are already manually configured.
+	existing := make(map[string]bool, len(s.cfg.Dependencies))
+	for _, dep := range s.cfg.Dependencies {
+		existing[dep.Name] = true
+	}
+
+	var added []config.DependencyConfig
+	for _, disc := range discovered {
+		if existing[disc.Name] {
+			s.logger.Debug("discovery skipping already-configured dependency", "name", disc.Name)
+			continue
+		}
+		s.cfg.Dependencies = append(s.cfg.Dependencies, disc)
+		added = append(added, disc)
+		s.logger.Info("discovery added dependency",
+			"name", disc.Name,
+			"prefix", disc.Prefix,
+			"repo_path", disc.RepoPath,
+		)
+	}
+
+	return added, nil
+}
+
 // LoadOrScan loads the registry from disk if available, otherwise scans.
 func (s *Scanner) LoadOrScan() ([]models.DependencyRegistry, error) {
 	registryPath := s.cfg.Scanner.RegistryPath
+
+	// Run discovery before scanning to merge auto-discovered deps.
+	if _, err := s.RunDiscovery(); err != nil {
+		s.logger.Error("discovery failed, continuing with configured deps", "error", err)
+	}
 
 	if !s.cfg.Scanner.ScanOnStartup {
 		regs, err := LoadRegistries(registryPath)

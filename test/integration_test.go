@@ -225,7 +225,7 @@ func TestFullScanPipeline(t *testing.T) {
 	logger := testLogger()
 
 	cfg := &config.Config{
-		LLM: config.LLMConfig{APIKey: "sk-test"},
+		LLM: config.LLMConfig{APIKey: "sk-test", MaxTokens: 16384, MaxContextTokens: 120000},
 		Scanner: config.ScannerConfig{
 			RegistryPath: filepath.Join(t.TempDir(), "registry.json"),
 		},
@@ -278,7 +278,7 @@ func TestEndToEnd_ServerFlow(t *testing.T) {
 
 	cfg := &config.Config{
 		Server: config.ServerConfig{Host: "127.0.0.1", Port: 0},
-		LLM:    config.LLMConfig{APIKey: "sk-test"},
+		LLM:    config.LLMConfig{APIKey: "sk-test", MaxTokens: 16384, MaxContextTokens: 120000},
 		Cache:  config.CacheConfig{Enabled: true, DBPath: filepath.Join(t.TempDir(), "test.db"), TTL: time.Hour},
 		Scanner: config.ScannerConfig{
 			RegistryPath: filepath.Join(t.TempDir(), "registry.json"),
@@ -516,7 +516,7 @@ func TestMatcherIntegration(t *testing.T) {
 	logger := testLogger()
 
 	cfg := &config.Config{
-		LLM: config.LLMConfig{APIKey: "sk-test"},
+		LLM: config.LLMConfig{APIKey: "sk-test", MaxTokens: 16384, MaxContextTokens: 120000},
 		Scanner: config.ScannerConfig{
 			RegistryPath: filepath.Join(t.TempDir(), "registry.json"),
 		},

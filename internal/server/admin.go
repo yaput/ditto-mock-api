@@ -133,6 +133,72 @@ func (s *Server) handleCacheStats(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, stats)
 }
 
+// handleEndpoints returns a flat list of all registered mock endpoints with their status.
+func (s *Server) handleEndpoints(w http.ResponseWriter, r *http.Request) {
+	// Build prefix map from config.
+	prefixes := make(map[string]string, len(s.cfg.Dependencies))
+	for _, dep := range s.cfg.Dependencies {
+		prefixes[dep.Name] = dep.Prefix
+	}
+
+	// Optional filter by dependency.
+	filterDep := r.URL.Query().Get("dependency")
+
+	type endpointEntry struct {
+		Method      string `json:"method"`
+		Path        string `json:"path"`
+		MockURL     string `json:"mock_url"`
+		Dependency  string `json:"dependency"`
+		Description string `json:"description"`
+		StatusCode  int    `json:"status_code"`
+		HasRequest  bool   `json:"has_request_schema"`
+		HasResponse bool   `json:"has_response_schema"`
+	}
+
+	var entries []endpointEntry
+	for _, reg := range s.registries {
+		if filterDep != "" && reg.Dependency != filterDep {
+			continue
+		}
+		prefix := prefixes[reg.Dependency]
+		if prefix == "" {
+			prefix = "/"
+		}
+
+		for _, ep := range reg.Endpoints {
+			mockPath := ep.Path
+			if prefix != "/" {
+				mockPath = strings.TrimSuffix(prefix, "/") + ep.Path
+			}
+
+			entries = append(entries, endpointEntry{
+				Method:      ep.Method,
+				Path:        ep.Path,
+				MockURL:     mockPath,
+				Dependency:  reg.Dependency,
+				Description: ep.Description,
+				StatusCode:  ep.StatusCode,
+				HasRequest:  ep.RequestBody != nil && len(ep.RequestBody.Fields) > 0,
+				HasResponse: ep.ResponseBody != nil && len(ep.ResponseBody.Fields) > 0,
+			})
+		}
+	}
+
+	type response struct {
+		Total     int             `json:"total"`
+		Endpoints []endpointEntry `json:"endpoints"`
+	}
+
+	if entries == nil {
+		entries = []endpointEntry{}
+	}
+
+	writeJSON(w, http.StatusOK, response{
+		Total:     len(entries),
+		Endpoints: entries,
+	})
+}
+
 // handleConfig returns the current running config with API key redacted.
 func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
 	// Deep copy via JSON round-trip to avoid mutating original.
